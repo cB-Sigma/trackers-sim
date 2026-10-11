@@ -1,0 +1,77 @@
+trackers-sim (simulated GPS trackers and AIS-140 devices, in Go)
+Copyright 2026 Abhinav Gautam
+
+This module is licensed under the Apache License, Version 2.0 (LICENSE).
+
+The code was written for SigmaM2M, a oneM2M platform, from the published
+protocol documents listed in PROVENANCE.md. It contains no code from
+other projects. Source files without a per-file header are covered by
+the copyright line above; files added for this module carry "Copyright
+2026 Abhinav Gautam" and "SPDX-License-Identifier: Apache-2.0".
+
+Dependencies
+------------
+
+trackers (https://github.com/cB-Sigma/trackers)
+Copyright 2026 Abhinav Gautam
+Licensed under the Apache License, Version 2.0.
+The protocol codecs the simulators encode for and the tests decode with.
+
+The Go standard library.
+
+No other dependency, direct or indirect.
+
+Traccar
+-------
+
+Traccar (https://github.com/traccar/traccar)
+Copyright Anton Tananaev and Traccar contributors
+Licensed under the Apache License, Version 2.0.
+
+No Traccar source code is included. The simulators build the frames that
+the trackers module's tests take from Traccar's protocol decoder tests
+(see the trackers NOTICE), and some demo identities are values from
+those tests: the terminal ID 866496077582164 (jt808sim), the IMEI
+359586015829802 (tk103sim test) and the IMEI 861693034634154 (examples
+and cmd/trackersim documentation). They are used as protocol facts and
+demo values.
+
+Traccar Client (https://github.com/traccar/traccar-client)
+Copyright Anton Tananaev
+Licensed under the Apache License, Version 2.0.
+
+Traccar Client SDK (https://github.com/traccar/traccar-client-sdk)
+Copyright 2024 Anton Tananaev
+Licensed under the Apache License, Version 2.0.
+
+Both were read for the requests osmandsim sends (the form POST and its
+parameters, the SOS alarm); no code was taken.
+
+Manufacturers' documents
+------------------------
+
+The frames follow the manufacturers' published protocol documents named
+in PROVENANCE.md (Concox, Teltonika, Coban, Queclink, Meitrack, Ruptela,
+Jimi IoT, HuaSunTeK, Cantrack) and, for ais140sim, the field layouts of
+AIS-140 and its amendments (ARAI). The layouts are protocol facts; no
+text of these documents is reproduced.
+
+Test data
+---------
+
+Every IMEI, ICCID, phone number, password, address, position and device
+ID in this module is a demo value. Apart from the Traccar values above,
+they are made up; none is taken from the AIS-140 standard's samples.
+
+Trademarks
+----------
+
+Concox, Jimi IoT, Teltonika, Queclink, Meitrack, Ruptela, HuaSunTeK,
+Cantrack, Sinotrack, Coban, Traccar and OsmAnd are trademarks or names of
+their owners. They are used here only to say which devices, protocols and
+software these simulators imitate. AIS-140 is a standard published by
+ARAI (Automotive Research Association of India) under the Ministry of
+Road Transport and Highways (MoRTH), Government of India; JT/T 808 is a
+standard of the Ministry of Transport of the People's Republic of China.
+This project is not affiliated with, sponsored or endorsed by any of these
+companies, projects or bodies.
