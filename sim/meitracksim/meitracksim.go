@@ -3,7 +3,11 @@
 // login frame), sends AAA event reports and CCE batches, and answers "@@"
 // commands with the same data identifier and command type ("C01,OK"; A10
 // with an AAA report of event 34), as the Meitrack GPRS protocol documents
-// show. Answers can be delayed or held.
+// show. Answers can be delayed or held. It keeps camera pictures as the
+// MVT600, T1, T333 and T3 do on their memory card: TakePicture stores one
+// and reports event 39 naming it, D00,<name>,<start> is answered with
+// eight picture packets from <start>, D01 with the picture list and D03
+// takes a picture. BatchCCC sends the older CCC binary batch.
 package meitracksim
 
 import (
@@ -51,6 +55,8 @@ type Tracker struct {
 	Last Pos
 	// IO is the I/O port word of reports (bits 0-7 outputs, 8-15 inputs).
 	IO uint16
+	// PacketSize is the picture bytes per D00 packet (default 512).
+	PacketSize int
 
 	c      net.Conn
 	closed chan struct{}
@@ -58,6 +64,8 @@ type Tracker struct {
 	cmds   []Command
 	seq    int
 	wmu    sync.Mutex
+	pics   map[string][]byte
+	order  []string
 }
 
 // Dial connects to the server.
@@ -113,12 +121,24 @@ func (t *Tracker) read() {
 		t.cmds = append(t.cmds, Command{ID: f.ID, Text: text})
 		hold := t.Hold
 		t.mu.Unlock()
-		if hold || f.Type == "AFF" {
+		if hold || f.Type == "AFF" || f.Type == "CCC" { // confirmations need no answer
 			continue
 		}
 		var dt time.Duration
 		if t.Delay != nil {
 			dt = t.Delay(text)
+		}
+		switch f.Type {
+		case "D00", "D01":
+			go func(id byte, typ, params string) {
+				time.Sleep(dt)
+				t.pictureAnswer(id, typ, params)
+			}(f.ID, f.Type, string(f.Data))
+			continue
+		case "D03":
+			if parts := strings.Split(string(f.Data), ","); len(parts) >= 2 && parts[1] != "" {
+				t.AddPicture(parts[1], SamplePicture(1500))
+			}
 		}
 		ans := t.answerText(text)
 		if dt > 0 {
@@ -269,6 +289,135 @@ func CCE(remaining uint32, pkts []CCEPacket) []byte {
 // Batch sends a CCE batch.
 func (t *Tracker) Batch(remaining uint32, pkts []CCEPacket) error {
 	return t.write(meitrack.Encode(false, t.nextID(), t.IMEI, append([]byte("CCE,"), CCE(remaining, pkts)...)))
+}
+
+// ---- pictures -----------------------------------------------------------------
+
+// AddPicture stores a picture on the simulated memory card.
+func (t *Tracker) AddPicture(name string, data []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pics == nil {
+		t.pics = map[string][]byte{}
+	}
+	if _, ok := t.pics[name]; !ok {
+		t.order = append(t.order, name)
+	}
+	t.pics[name] = append([]byte(nil), data...)
+}
+
+// TakePicture stores a picture and reports event 39 naming it, as a
+// tracker does after a photographing event.
+func (t *Tracker) TakePicture(name string, data []byte, p Pos) error {
+	t.AddPicture(name, data)
+	t.mu.Lock()
+	t.Last = p
+	t.mu.Unlock()
+	return t.write(meitrack.Encode(false, t.nextID(), t.IMEI, []byte("AAA,"+AAAWith(39, p, t.IO, name))))
+}
+
+// SamplePicture is a made-up JPEG-shaped picture of n bytes (FF D8 … FF D9).
+func SamplePicture(n int) []byte {
+	b := make([]byte, max(n, 4))
+	for i := range b {
+		b[i] = byte(i * 7)
+	}
+	b[0], b[1], b[len(b)-2], b[len(b)-1] = 0xFF, 0xD8, 0xFF, 0xD9
+	return b
+}
+
+// pictureAnswer answers D00 with eight packets from the asked one, and D01
+// with the picture list, each with the command's data identifier.
+func (t *Tracker) pictureAnswer(id byte, typ, params string) {
+	t.mu.Lock()
+	size := t.PacketSize
+	if size <= 0 {
+		size = 512
+	}
+	parts := strings.Split(params, ",")
+	var pic []byte
+	var names []string
+	if typ == "D00" && len(parts) >= 1 {
+		pic = t.pics[parts[0]]
+	}
+	names = append(names, t.order...)
+	t.mu.Unlock()
+	if typ == "D01" {
+		_ = t.Reply(id, "D01,1,0,"+strings.Join(names, "|")+"|")
+		return
+	}
+	start := 0
+	if len(parts) >= 2 {
+		start, _ = strconv.Atoi(parts[1])
+	}
+	if pic == nil || start < 0 {
+		_ = t.Reply(id, "D00,FAIL")
+		return
+	}
+	total := (len(pic) + size - 1) / size
+	for i := start; i < total && i < start+8; i++ {
+		body := append([]byte(fmt.Sprintf("D00,%s,%d,%d,", parts[0], total, i)), pic[i*size:min((i+1)*size, len(pic))]...)
+		if t.write(meitrack.Encode(false, id, t.IMEI, body)) != nil {
+			return
+		}
+	}
+}
+
+// AAAWith is AAA with the assisted event data field (a picture name for
+// event 39, a geofence number for 20 and 21).
+func AAAWith(event int, p Pos, io uint16, assisted string) string {
+	s := AAA(event, p, io)
+	i := strings.Index(s, ",,,3,,")
+	return s[:i] + "," + assisted + ",,3,,"
+}
+
+// ---- CCC --------------------------------------------------------------------
+
+// CCCRecord is one record of a CCC batch.
+type CCCRecord struct {
+	Event int
+	Pos   Pos
+	// IO is the I/O status word; Battery and External are in hundredths of
+	// a volt.
+	IO, AD1, Battery, External uint16
+	MCC, MNC, LAC, CID         uint16
+}
+
+// CCC builds the binary data of a CCC batch (after "CCC,"): the 8-byte
+// header with the 52-byte record length, then the records, in the layout
+// the meitrack package reads.
+func CCC(recs []CCCRecord) []byte {
+	le16 := binary.LittleEndian.AppendUint16
+	le32 := binary.LittleEndian.AppendUint32
+	b := []byte{2, 1, 52, 0}
+	b = le32(b, 0)
+	for _, r := range recs {
+		valid := byte(0)
+		if r.Pos.Valid {
+			valid = 1
+		}
+		b = append(b, byte(r.Event))
+		b = le32(b, uint32(int32(r.Pos.Lat*1e6)))
+		b = le32(b, uint32(int32(r.Pos.Lon*1e6)))
+		b = le32(b, uint32(r.Pos.Time.UTC().Sub(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))/time.Second))
+		b = append(b, valid, byte(r.Pos.Sats), 22)
+		b = le16(b, uint16(r.Pos.Speed))
+		b = le16(b, uint16(r.Pos.Course))
+		b = le16(b, 10)
+		b = le16(b, uint16(int16(r.Pos.Alt)))
+		b = le32(b, 5120)
+		b = le32(b, 3600)
+		for _, v := range []uint16{r.MCC, r.MNC, r.LAC, r.CID, r.IO, r.AD1, r.Battery, r.External} {
+			b = le16(b, v)
+		}
+		b = le32(b, 0)
+	}
+	return b
+}
+
+// BatchCCC sends a CCC batch; the server confirms it with CCC,<count>.
+func (t *Tracker) BatchCCC(recs []CCCRecord) error {
+	return t.write(meitrack.Encode(false, t.nextID(), t.IMEI, append([]byte("CCC,"), CCC(recs)...)))
 }
 
 // String shows a command with its data identifier.

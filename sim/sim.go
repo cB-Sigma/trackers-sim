@@ -21,6 +21,10 @@ import (
 	"time"
 
 	"github.com/cB-Sigma/trackers-sim/sim/ais140sim"
+	"github.com/cB-Sigma/trackers-sim/sim/atracksim"
+	"github.com/cB-Sigma/trackers-sim/sim/calampsim"
+	"github.com/cB-Sigma/trackers-sim/sim/eelinksim"
+	"github.com/cB-Sigma/trackers-sim/sim/galileoskysim"
 	"github.com/cB-Sigma/trackers-sim/sim/gt06sim"
 	"github.com/cB-Sigma/trackers-sim/sim/h02sim"
 	"github.com/cB-Sigma/trackers-sim/sim/jt808sim"
@@ -28,8 +32,11 @@ import (
 	"github.com/cB-Sigma/trackers-sim/sim/osmandsim"
 	"github.com/cB-Sigma/trackers-sim/sim/queclinksim"
 	"github.com/cB-Sigma/trackers-sim/sim/ruptelasim"
+	"github.com/cB-Sigma/trackers-sim/sim/suntechsim"
 	"github.com/cB-Sigma/trackers-sim/sim/teltonikasim"
 	"github.com/cB-Sigma/trackers-sim/sim/tk103sim"
+	"github.com/cB-Sigma/trackers-sim/sim/watchsim"
+	"github.com/cB-Sigma/trackers-sim/sim/wialonsim"
 )
 
 // Pos is the simulated vehicle's state at one report.
@@ -88,6 +95,75 @@ var dialers = map[string]func(Config) (device, error){
 			return nil, err
 		}
 		return ais140Dev{d}, nil
+	},
+	"atrack": func(c Config) (device, error) {
+		t, err := atracksim.Dial(c.Server, c.IMEI)
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Login(); err != nil {
+			_ = t.Close()
+			return nil, err
+		}
+		return atrackDev{t}, nil
+	},
+	"calamp": func(c Config) (device, error) {
+		t, err := calampsim.Dial(c.Server, c.IMEI)
+		if err != nil {
+			return nil, err
+		}
+		return calampDev{t}, nil
+	},
+	"eelink": func(c Config) (device, error) {
+		t, err := eelinksim.Dial(c.Server, c.IMEI)
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Login(); err != nil {
+			_ = t.Close()
+			return nil, err
+		}
+		return eelinkDev{t}, nil
+	},
+	"galileosky": func(c Config) (device, error) {
+		t, err := galileoskysim.Dial(c.Server, c.IMEI)
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Head(); err != nil {
+			_ = t.Close()
+			return nil, err
+		}
+		return galileoskyDev{t}, nil
+	},
+	"suntech": func(c Config) (device, error) {
+		t, err := suntechsim.Dial(c.Server, c.IMEI, "")
+		if err != nil {
+			return nil, err
+		}
+		return suntechDev{t}, nil
+	},
+	"watch": func(c Config) (device, error) {
+		t, err := watchsim.Dial(c.Server, tail(c.IMEI, 10))
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Login(); err != nil {
+			_ = t.Close()
+			return nil, err
+		}
+		return watchDev{t}, nil
+	},
+	"wialon": func(c Config) (device, error) {
+		t, err := wialonsim.Dial(c.Server, c.IMEI)
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Login(); err != nil {
+			_ = t.Close()
+			return nil, err
+		}
+		return wialonDev{t}, nil
 	},
 	"gt06": func(c Config) (device, error) {
 		t, err := gt06sim.Dial(c.Server, c.IMEI)
@@ -273,6 +349,63 @@ func (a ais140Dev) report(p Pos) error {
 }
 func (a ais140Dev) commands() []string { return a.d.Commands() }
 func (a ais140Dev) close() error       { return a.d.Close() }
+
+type atrackDev struct{ t *atracksim.Tracker }
+
+func (a atrackDev) report(p Pos) error {
+	return a.t.Report(atracksim.Pos{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Speed: p.Speed, Heading: p.Heading, Sats: 9})
+}
+func (a atrackDev) commands() []string { return a.t.Commands() }
+func (a atrackDev) close() error       { return a.t.Close() }
+
+type calampDev struct{ t *calampsim.Tracker }
+
+func (c calampDev) report(p Pos) error {
+	return c.t.Event(calampsim.Pos{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Alt: 900, Speed: p.Speed, Heading: int(p.Heading), Sats: 9, Valid: true}, 0)
+}
+func (c calampDev) commands() []string { return c.t.Commands() }
+func (c calampDev) close() error       { return c.t.Close() }
+
+type eelinkDev struct{ t *eelinksim.Tracker }
+
+func (e eelinkDev) report(p Pos) error {
+	return e.t.Location(eelinksim.Pos{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Speed: p.Speed, Heading: p.Heading, Sats: 9, Valid: true})
+}
+func (e eelinkDev) commands() []string { return e.t.Commands() }
+func (e eelinkDev) close() error       { return e.t.Close() }
+
+type galileoskyDev struct{ t *galileoskysim.Tracker }
+
+func (g galileoskyDev) report(p Pos) error {
+	return g.t.Records(false, galileoskysim.Rec{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Speed: p.Speed, Heading: p.Heading, Alt: 900, Sats: 9, HDOP: 0.9,
+		Power: 12.4, Battery: 4.1})
+}
+func (g galileoskyDev) commands() []string { return g.t.Commands() }
+func (g galileoskyDev) close() error       { return g.t.Close() }
+
+type suntechDev struct{ t *suntechsim.Tracker }
+
+func (s suntechDev) report(p Pos) error {
+	return s.t.Status(suntechsim.Pos{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Speed: p.Speed, Course: p.Heading, Sats: 9, Valid: true})
+}
+func (s suntechDev) commands() []string { return s.t.Commands() }
+func (s suntechDev) close() error       { return s.t.Close() }
+
+type watchDev struct{ t *watchsim.Tracker }
+
+func (w watchDev) report(p Pos) error {
+	return w.t.Report(watchsim.Pos{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Speed: p.Speed, Heading: p.Heading, Sats: 9, Valid: true})
+}
+func (w watchDev) commands() []string { return w.t.Commands() }
+func (w watchDev) close() error       { return w.t.Close() }
+
+type wialonDev struct{ t *wialonsim.Tracker }
+
+func (w wialonDev) report(p Pos) error {
+	return w.t.Data(wialonsim.Pos{Time: p.Time, Lat: p.Lat, Lon: p.Lon, Speed: p.Speed, Heading: p.Heading, Alt: 900, Sats: 9, HDOP: 0.9})
+}
+func (w wialonDev) commands() []string { return w.t.Commands() }
+func (w wialonDev) close() error       { return w.t.Close() }
 
 type gt06Dev struct{ t *gt06sim.Tracker }
 

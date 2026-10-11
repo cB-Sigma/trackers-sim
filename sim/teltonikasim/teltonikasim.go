@@ -1,15 +1,25 @@
+// Copyright 2026 Abhinav Gautam
+// SPDX-License-Identifier: Apache-2.0
+
 // Package teltonikasim is a Teltonika tracker for tests and demos: IMEI
-// handshake, Codec 8 / 8E AVL packets over TCP or UDP, and Codec 12
-// command answers.
+// handshake, Codec 8 / 8E / 16 AVL packets over TCP or UDP, Codec 13 and
+// Codec 15 device messages, and answers to Codec 12 commands (in Codec
+// 12, or Codec 13 / 15 when set) and Codec 14 commands (an ACK for its own
+// IMEI, the "IMEI does not match" nACK otherwise). It keeps the values of
+// setparam commands, answers getparam, and takes its reporting period from
+// the data acquisition parameters (Interval).
 package teltonikasim
 
 import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +41,8 @@ type Record struct {
 	IO2      map[uint16]uint16
 	IO4      map[uint16]uint32
 	IO8      map[uint16]uint64
+	// Generation is Codec 16's record generation type (7 periodical).
+	Generation byte
 }
 
 // AVL encodes records as an AVL data array (codec..count2) in Codec 8 or 8E.
@@ -39,10 +51,28 @@ func AVL(ext bool, recs []Record) []byte {
 	if ext {
 		codec = teltonika.Codec8E
 	}
+	b, _ := AVLCodec(codec, recs)
+	return b
+}
+
+// AVLCodec encodes records as an AVL data array in Codec 8, 8E or 16.
+func AVLCodec(codec byte, recs []Record) ([]byte, error) {
+	if codec != teltonika.Codec8 && codec != teltonika.Codec8E && codec != teltonika.Codec16 {
+		return nil, fmt.Errorf("teltonikasim: codec 0x%02X is not an AVL codec", codec)
+	}
+	ext := codec == teltonika.Codec8E
 	b := []byte{codec, byte(len(recs))}
+	// IDs: 1 byte in Codec 8, 2 in 8E and 16; counts: 2 bytes in 8E only.
 	id := func(v uint16) {
-		if ext {
+		if codec == teltonika.Codec8 {
+			b = append(b, byte(v))
+		} else {
 			b = binary.BigEndian.AppendUint16(b, v)
+		}
+	}
+	count := func(v int) {
+		if ext {
+			b = binary.BigEndian.AppendUint16(b, uint16(v))
 		} else {
 			b = append(b, byte(v))
 		}
@@ -57,23 +87,26 @@ func AVL(ext bool, recs []Record) []byte {
 		b = append(b, r.Sats)
 		b = binary.BigEndian.AppendUint16(b, r.Speed)
 		id(r.Event)
-		id(uint16(len(r.IO1) + len(r.IO2) + len(r.IO4) + len(r.IO8)))
-		id(uint16(len(r.IO1)))
+		if codec == teltonika.Codec16 {
+			b = append(b, r.Generation)
+		}
+		count(len(r.IO1) + len(r.IO2) + len(r.IO4) + len(r.IO8))
+		count(len(r.IO1))
 		for k, v := range r.IO1 {
 			id(k)
 			b = append(b, v)
 		}
-		id(uint16(len(r.IO2)))
+		count(len(r.IO2))
 		for k, v := range r.IO2 {
 			id(k)
 			b = binary.BigEndian.AppendUint16(b, v)
 		}
-		id(uint16(len(r.IO4)))
+		count(len(r.IO4))
 		for k, v := range r.IO4 {
 			id(k)
 			b = binary.BigEndian.AppendUint32(b, v)
 		}
-		id(uint16(len(r.IO8)))
+		count(len(r.IO8))
 		for k, v := range r.IO8 {
 			id(k)
 			b = binary.BigEndian.AppendUint64(b, v)
@@ -82,7 +115,7 @@ func AVL(ext bool, recs []Record) []byte {
 			b = binary.BigEndian.AppendUint16(b, 0)
 		}
 	}
-	return append(b, byte(len(recs)))
+	return append(b, byte(len(recs))), nil
 }
 
 // TCPPacket wraps an AVL data array with preamble, length and CRC.
@@ -105,16 +138,21 @@ func UDPPacket(packetID uint16, avlID byte, imei string, data []byte) []byte {
 
 // Tracker is a TCP device.
 type Tracker struct {
-	IMEI   string
-	Answer func(cmd string) string // nil answers "OK"
+	IMEI string
+	// Answer, when set, gives the answer text to a command; nil answers
+	// setparam with "New value …", getparam with "Param ID:… Value:…" and
+	// anything else with "OK".
+	Answer func(cmd string) string
 	// Delay, when set, holds the answer to a command this long (a slow
 	// device, or one whose answer arrives after the server gave up).
 	Delay func(cmd string) time.Duration
 
-	c    net.Conn
-	acks chan []byte
-	mu   sync.Mutex
-	cmds []string
+	c        net.Conn
+	acks     chan []byte
+	mu       sync.Mutex
+	cmds     []string
+	params   map[int]string
+	answerIn byte
 }
 
 // Dial connects and performs the IMEI handshake; it reports whether the
@@ -124,7 +162,14 @@ func Dial(addr, imei string) (*Tracker, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	t := &Tracker{IMEI: imei, c: c, acks: make(chan []byte, 16)}
+	return Accept(c, imei)
+}
+
+// Accept performs the IMEI handshake on a connection the caller opened
+// (or a pipe in tests) and starts reading the server's frames. On a
+// refusal the connection is closed and ok is false.
+func Accept(c net.Conn, imei string) (t *Tracker, ok bool, err error) {
+	t = &Tracker{IMEI: imei, c: c, acks: make(chan []byte, 16), params: map[int]string{}}
 	hs := binary.BigEndian.AppendUint16(nil, uint16(len(imei)))
 	if _, err := c.Write(append(hs, imei...)); err != nil {
 		return nil, false, err
@@ -142,6 +187,16 @@ func Dial(addr, imei string) (*Tracker, bool, error) {
 	}
 	go t.read()
 	return t, true, nil
+}
+
+// SetAnswerCodec chooses how Codec 12 commands are answered: 0 or
+// teltonika.Codec12 (the default), teltonika.Codec13 (a timestamped
+// message, as with the "Message Timestamp" setting) or teltonika.Codec15
+// (timestamp and IMEI). Codec 14 commands are always answered in Codec 14.
+func (t *Tracker) SetAnswerCodec(codec byte) {
+	t.mu.Lock()
+	t.answerIn = codec
+	t.mu.Unlock()
 }
 
 func (t *Tracker) read() {
@@ -173,28 +228,128 @@ func (t *Tracker) read() {
 			close(t.acks)
 			return
 		}
-		text, typ, err := teltonika.ParseCodec12(d[:n])
-		if err != nil || typ != teltonika.TypeCmd {
-			continue
+		t.command(d[:n])
+	}
+}
+
+// command handles one command frame's data field (codec..count2).
+func (t *Tracker) command(d []byte) {
+	var text string
+	var typ byte
+	var err error
+	codec14 := len(d) > 0 && d[0] == teltonika.Codec14
+	if codec14 {
+		text, typ, err = teltonika.ParseCodec14(d)
+	} else {
+		text, typ, err = teltonika.ParseCodec12(d)
+	}
+	if err != nil || typ != teltonika.TypeCmd {
+		return
+	}
+	t.mu.Lock()
+	t.cmds = append(t.cmds, text)
+	answerIn := t.answerIn
+	t.mu.Unlock()
+	if codec14 {
+		to, err := teltonika.ParseCodec14IMEI(d)
+		if err != nil || to != strings.TrimLeft(t.IMEI, "0") {
+			// Not this device: not run, answered with the nACK type.
+			if f, err := teltonika.Codec14Message(t.IMEI, teltonika.TypeNotMine, ""); err == nil {
+				_, _ = t.c.Write(f)
+			}
+			return
 		}
+	}
+	ans := t.run(text)
+	if t.Answer != nil {
+		ans = t.Answer(text)
+	}
+	var f []byte
+	switch {
+	case codec14:
+		f, err = teltonika.Codec14Message(t.IMEI, teltonika.TypeResp, ans)
+	case answerIn == teltonika.Codec13:
+		f = teltonika.Codec13Frame(time.Now(), ans)
+	case answerIn == teltonika.Codec15:
+		f, err = teltonika.Codec15Frame(t.IMEI, codec15Type, time.Now(), ans)
+	default:
+		f = teltonika.Codec12Frame(teltonika.TypeResp, ans)
+	}
+	if err != nil {
+		return
+	}
+	if t.Delay != nil {
+		if dt := t.Delay(text); dt > 0 {
+			go func() {
+				time.Sleep(dt)
+				_, _ = t.c.Write(f)
+			}()
+			return
+		}
+	}
+	_, _ = t.c.Write(f)
+}
+
+// codec15Type is the message type of the Codec 15 messages sent (the
+// value in Teltonika's example; devices make it a setting).
+const codec15Type = 0x0B
+
+// run carries out setparam and getparam and returns the device's answer.
+func (t *Tracker) run(cmd string) string {
+	verb, args, _ := strings.Cut(strings.TrimSpace(cmd), " ")
+	switch strings.ToLower(verb) {
+	case "setparam":
+		var set []string
 		t.mu.Lock()
-		t.cmds = append(t.cmds, text)
-		t.mu.Unlock()
-		ans := "OK"
-		if t.Answer != nil {
-			ans = t.Answer(text)
-		}
-		if t.Delay != nil {
-			if dt := t.Delay(text); dt > 0 {
-				go func() {
-					time.Sleep(dt)
-					_, _ = t.c.Write(teltonika.Codec12Frame(teltonika.TypeResp, ans))
-				}()
+		for _, pair := range strings.Split(args, ";") {
+			k, v, ok := strings.Cut(strings.TrimSpace(pair), ":")
+			id, err := strconv.Atoi(k)
+			if !ok || err != nil {
 				continue
 			}
+			t.params[id] = v
+			set = append(set, k+":"+v)
 		}
-		_, _ = t.c.Write(teltonika.Codec12Frame(teltonika.TypeResp, ans))
+		t.mu.Unlock()
+		return "New value " + strings.Join(set, ";")
+	case "getparam":
+		var out []string
+		t.mu.Lock()
+		for _, k := range strings.Split(args, ";") {
+			k = strings.TrimSpace(k)
+			id, err := strconv.Atoi(k)
+			if err != nil {
+				continue
+			}
+			out = append(out, "Param ID:"+k+" Value:"+t.params[id])
+		}
+		t.mu.Unlock()
+		return strings.Join(out, "; ")
 	}
+	return "OK"
+}
+
+// Params returns the values setparam commands gave, by parameter ID.
+func (t *Tracker) Params() map[int]string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[int]string, len(t.params))
+	for k, v := range t.params {
+		out[k] = v
+	}
+	return out
+}
+
+// Interval is the reporting period the server set: the home network
+// moving "Min Period" (parameter 10050), or 0 when none was set.
+func (t *Tracker) Interval() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s, err := strconv.Atoi(t.params[10050])
+	if err != nil || s <= 0 {
+		return 0
+	}
+	return time.Duration(s) * time.Second
 }
 
 // Commands lists the commands received.
@@ -210,6 +365,36 @@ func (t *Tracker) Send(ext bool, recs ...Record) (int, error) {
 		return 0, err
 	}
 	return t.ack()
+}
+
+// SendCodec sends records in Codec 8, 8E or 16 and returns the number the
+// server acknowledged.
+func (t *Tracker) SendCodec(codec byte, recs ...Record) (int, error) {
+	data, err := AVLCodec(codec, recs)
+	if err != nil {
+		return 0, err
+	}
+	return t.SendRaw(TCPPacket(data))
+}
+
+// SendMessage sends a one-way device message in Codec 13 (with its time)
+// or Codec 15 (with its time and the IMEI); the server does not answer.
+func (t *Tracker) SendMessage(codec byte, at time.Time, text string) error {
+	var f []byte
+	var err error
+	switch codec {
+	case teltonika.Codec13:
+		f = teltonika.Codec13Frame(at, text)
+	case teltonika.Codec15:
+		f, err = teltonika.Codec15Frame(t.IMEI, codec15Type, at, text)
+	default:
+		return fmt.Errorf("teltonikasim: codec 0x%02X is not a device message codec", codec)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = t.c.Write(f)
+	return err
 }
 
 // SendRaw writes bytes and waits for an acknowledgement.

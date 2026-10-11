@@ -1,7 +1,9 @@
 // Package h02sim is an H02 tracker (Sinotrack ST-901 class) for tests and
 // demos. Like the real device it has no login exchange: it identifies
-// itself with its id in every frame, sends V1 positions, HTBT heartbeats
-// (and waits for the echo), binary '$' records and NBR cell reports, and
+// itself with its id in every frame, sends V1 and VP1 positions, VP1 and V3
+// cell reports, ALRM alarms, BC stored positions (history), HTBT
+// heartbeats (and waits for the echo), binary '$' records of 32 and 45
+// bytes, Cantrack Y-model records and NBR cell reports, and
 // answers commands with V4 in the documents' form: the command word, a
 // result, the command's time when the command carried one, the answer time
 // and its position. A CR (locate) is answered and followed by a position.
@@ -375,4 +377,131 @@ func (t *Tracker) Answer(frame string) error {
 		return t.Position(pos)
 	}
 	return nil
+}
+
+// VP1Frame is a short VP1 position frame (no time of day: the server
+// takes it as now).
+func VP1Frame(id string, p Pos) string {
+	v := "V"
+	if p.Valid {
+		v = "A"
+	}
+	tm := p.Time
+	if tm.IsZero() {
+		tm = time.Now().UTC()
+	}
+	return fmt.Sprintf("*HQ,%s,VP1,%s,%s,%s,%s,%s,%.2f,%03d,%s,%08X#", id, v, dm(p.Lat, 2), hemi(p.Lat, "N", "S"),
+		dm(p.Lon, 3), hemi(p.Lon, "E", "W"), p.Speed, p.Course, tm.UTC().Format("020106"), word(p))
+}
+
+// VP1 sends a short VP1 position and remembers it as the last one.
+func (t *Tracker) VP1(p Pos) error {
+	if !p.Valid {
+		return errors.New("a VP1 position is valid (A); an invalid one is sent as cells (VP1Cells)")
+	}
+	t.setLast(p)
+	return t.write(VP1Frame(t.ID, p))
+}
+
+// Cell is a mobile cell: location area, cell ID and a signal (a level for
+// VP1, dBm for V3).
+type Cell struct {
+	LAC, CID, Signal int
+}
+
+// VP1Cells sends the VP1 form without a fix: the cells separated by 'Y'.
+func (t *Tracker) VP1Cells(mcc, mnc int, cells []Cell) error {
+	s := fmt.Sprintf("*HQ,%s,VP1,V,%d,%d", t.ID, mcc, mnc)
+	for i, c := range cells {
+		if i > 0 {
+			s += "Y"
+		} else {
+			s += ","
+		}
+		s += fmt.Sprintf("%d,%d,%d", c.LAC, c.CID, c.Signal)
+	}
+	return t.write(s + "Y#")
+}
+
+// V3 sends a Cantrack V3 cell report: MCC and MNC, the cells with their
+// signal in dBm, and the battery voltage (up to 5.6 V).
+func (t *Tracker) V3(mcc, mnc int, cells []Cell, battery float64) error {
+	now := time.Now().UTC()
+	s := fmt.Sprintf("*HQ,%s,V3,%s,%03d%02d,%02d", t.ID, now.Format("150405"), mcc, mnc, len(cells))
+	for _, c := range cells {
+		s += fmt.Sprintf(",%06d,%06d,,%d", c.LAC, c.CID, c.Signal)
+	}
+	s += fmt.Sprintf(",%04X,0,X,%s,%08X#", int(battery/5.6*1024+0.5), now.Format("020106"), word(t.last()))
+	return t.write(s)
+}
+
+// Alarm types of ALRM.
+const (
+	AlarmSOS        = 1
+	AlarmLowBattery = 2
+	AlarmGeofence   = 3
+)
+
+// Alarm sends an ALRM frame of this type with a position.
+func (t *Tracker) Alarm(kind int, p Pos) error {
+	t.setLast(p)
+	return t.write(fmt.Sprintf("*HQ,%s,ALRM,%d,%s#", t.ID, kind, fields(p)))
+}
+
+// Blind sends positions stored while out of coverage as one BC frame
+// (each stored position names only its day of the month).
+func (t *Tracker) Blind(ps []Pos) error {
+	if len(ps) == 0 {
+		return errors.New("no stored positions")
+	}
+	var segs []string
+	for _, p := range ps {
+		v := "V"
+		if p.Valid {
+			v = "A"
+		}
+		tm := p.Time.UTC()
+		segs = append(segs, fmt.Sprintf("%s,%s,%s,%s,%s,%.2f,%03d,%s,%08X,194,0,25FC,F48", v, dm(p.Lat, 2), hemi(p.Lat, "N", "S"),
+			dm(p.Lon, 3), hemi(p.Lon, "E", "W"), p.Speed, p.Course, tm.Format("02150405"), word(p)))
+	}
+	body := strings.Join(segs, ";")
+	return t.write(fmt.Sprintf("*HQ,%s,BC,%s,%d,%s#", t.ID, time.Now().UTC().Format("150405"), len(body), body))
+}
+
+// LongBinaryFrame is the 45-byte form of BinaryFrame: the 32-byte record
+// and 13 more bytes, which no public document describes (sent as zeros).
+func LongBinaryFrame(id string, p Pos) []byte {
+	b := BinaryFrame(id, p)
+	if b == nil {
+		return nil
+	}
+	return append(b, make([]byte, 13)...)
+}
+
+// LongBinary sends a 45-byte binary record.
+func (t *Tracker) LongBinary(p Pos) error {
+	b := LongBinaryFrame(t.ID, p)
+	if b == nil {
+		return errors.New("binary records carry a 10-digit device id; " + t.ID + " is not one")
+	}
+	t.setLast(p)
+	return t.write(string(b))
+}
+
+// YFrame is a Cantrack Y-model record: two analog inputs (fuel level is
+// the tank capacity times analog1/analog2) and the position; it carries no
+// device id.
+func YFrame(analog1, analog2 uint16, record byte, p Pos) []byte {
+	b := BinaryFrame("0000000000", p)
+	b[0] = 'Y'
+	b[1], b[2], b[3], b[4], b[5] = byte(analog1>>8), byte(analog1), byte(analog2>>8), byte(analog2), 0x00
+	b[31] = record
+	return b
+}
+
+// Y sends a Y-model record; the server knows the device from the frames
+// before it (send a position or heartbeat first).
+func (t *Tracker) Y(analog1, analog2 uint16, record byte, p Pos) error {
+	t.setLast(p)
+	return t.write(string(YFrame(analog1, analog2, record, p)))
 }

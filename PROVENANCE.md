@@ -12,7 +12,10 @@ The `sim` runner, `tk103sim` and `cmd/trackersim` were written on
 the simulators moved into this separate module on 2026-10-11 so the
 library does not depend on them. The tests of each per-protocol
 simulator against the library's codec (`sim/<protocol>sim/*_test.go`,
-`sim/internal/codectest`) were added then.
+`sim/internal/codectest`) were added then. For v0.2.0 (2026-10-11/12)
+the simulators of the seven new protocols were added and the existing
+ones extended, and the `interop` module (a separate, test-only Go module)
+was written to run every simulator against Traccar's server in Docker.
 
 ## Sources
 
@@ -22,14 +25,22 @@ package comment names the parts it imitates.
 
 | Package | Followed |
 |---|---|
-| `gt06sim` | Concox GT06 protocol tables (login, location, status, alarm, LBS, WiFi, 0x80 commands and answers) |
-| `teltonikasim` | Teltonika's protocol description: IMEI handshake, codecs 8 and 8E over TCP and UDP, codec 12 answers |
+| `gt06sim` | Concox GT06 protocol tables (login, location, status, alarm, LBS, WiFi, 0x80 commands and answers); Concox GK310 V1.0.3 for 0x23, 0xA0, 0xA1 and the 0x94 sub-types |
+| `teltonikasim` | Teltonika's protocol description: IMEI handshake, codecs 8, 8E and 16 over TCP and UDP, codec 12, 13, 14 and 15 messages and answers; the FMB `setparam` parameter lists |
 | `tk103sim` | The GPS103 (Coban) protocol document |
-| `queclinksim` | Queclink GV300N @Track Air Interface Protocol V3.01 and GV300 V2.40 |
-| `meitracksim` | Meitrack GPRS Protocol V1.8 and the GPRS (CCE ID) Protocol V1.0 |
+| `queclinksim` | Queclink GV300N @Track Air Interface Protocol V3.01 (ASCII and HEX) and GV300 V2.40; its HEX CRC is its own code, independent of the codec's |
+| `meitracksim` | Meitrack GPRS Protocol V1.8 (with the D00/D01/D03 picture sections) and the GPRS (CCE ID) Protocol V1.0; the CCC layout as the trackers codec reads it (facts from Traccar's decoder) |
 | `ruptelasim` | Ruptela Protocol v1.113 and the Ruptela SMS command list |
-| `jt808sim` | JT/T 808-2013 (English translation) and the 2019 header; Jimi IoT text answers |
+| `jt808sim` | JT/T 808-2011/2013 (English translations) and the 2019 header; Jimi IoT text answers; active-safety and JT/T 1078 layouts as documented by cuteLittleDevil/go-jt808 (MIT, facts only) |
 | `h02sim` | HuaSunTeK GPS Tracker Communication Protocol V1.0.5 and Cantrack protocol A/1 |
+| `wialonsim` | Gurtam Wialon IPS v2.0 (with the 1.1 forms) |
+| `galileoskysim` | Galileosky User's Manual v5.0 (server exchange protocol and command list) |
+| `suntechsim` | the Suntech layouts as the trackers codec reads them (no public Suntech document; facts from Traccar's decoder) |
+| `calampsim` | the LM Direct layouts as the trackers codec reads them (CalAmp's guide is not public; facts from Traccar's decoder) |
+| `atracksim` | ATrack Protocol Document rev 1.3.6 |
+| `eelinksim` | EELINK Device Protocol V2.0 |
+| `watchsim` | 3G Electronics "Communication Protocol" V1.7_C |
+| `interop` | Traccar's REST API (openapi.yaml at tag v6.16.0) for devices, routes, events and commands; Traccar's default protocol ports (PortConfigSuffix at v6.16.0); the command encoders read at v6.16.0 for the comparison notes |
 | `osmandsim` | traccar.org/osmand and traccar.org/forward; Traccar Client and its SDK, read for the request forms (no code taken) |
 | `ais140sim` | AIS-140 (ARAI) with Amendments 1 to 3: the login, data, health and emergency packet layouts, Table 4D commands and responses, the activation and health check answers (Amendment 2, clause 8.4) |
 

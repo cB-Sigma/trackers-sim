@@ -3,7 +3,12 @@
 // (command 68), heartbeats and trouble codes, waits for the server's
 // acknowledgements, and answers SMS commands sent over GPRS (command 108)
 // the way the device's SMS command list describes, echoing an ID tag when
-// the command carries one, and set-IO-value commands (117).
+// the command carries one, and set-IO-value commands (117). It also
+// answers the version request (103) with command 3, takes the connection
+// (105) and odometer (106) settings, and keeps camera files: AddFile
+// stores one, the file list (137, subcommand 1) is answered with the names
+// and a file request (137, subcommand 2) with that packet, as the device
+// sends one packet per request. DTCs builds diagnostic trouble codes.
 package ruptelasim
 
 import (
@@ -38,13 +43,32 @@ type Tracker struct {
 	// SetIOResult is the result byte of a set-IO-value answer (0 changed,
 	// 1 failed, 2 not supported).
 	SetIOResult byte
+	// Version is the answer to a version request (103): bootloader,
+	// firmware, hardware, GSM level and voltage state.
+	Version string
+	// PacketSize is the file bytes per files packet (default 512).
+	PacketSize int
 
-	c    net.Conn
-	acks chan ack
-	mu   sync.Mutex
-	cmds []string
-	sets [][2]uint32
-	wmu  sync.Mutex
+	c     net.Conn
+	acks  chan ack
+	mu    sync.Mutex
+	cmds  []string
+	sets  [][2]uint32
+	wmu   sync.Mutex
+	bin   []Binary
+	files map[fileKey][]byte
+}
+
+// Binary is a binary command the tracker received (not an SMS command,
+// set-IO value or acknowledgement): its command ID and payload.
+type Binary struct {
+	Cmd     byte
+	Payload []byte
+}
+
+type fileKey struct {
+	source int
+	name   string
 }
 
 type ack struct {
@@ -124,6 +148,15 @@ func (t *Tracker) read() {
 			t.sets = append(t.sets, [2]uint32{binary.BigEndian.Uint32(p[0:4]), binary.BigEndian.Uint32(p[4:8])})
 			t.mu.Unlock()
 			_ = t.write(ruptela.DeviceFrame(t.IMEI, ruptela.CmdSetIOAnswer, []byte{t.SetIOResult}))
+		case ruptela.GetVersion, ruptela.SetConnection, ruptela.SetOdometer, ruptela.Files:
+			t.mu.Lock()
+			t.bin = append(t.bin, Binary{cmd, append([]byte(nil), p...)})
+			hold := t.Hold
+			t.mu.Unlock()
+			if hold {
+				continue
+			}
+			t.binaryAnswer(cmd, p)
 		default:
 			t.acks <- ack{cmd, p}
 		}
@@ -332,4 +365,118 @@ func (t *Tracker) Records(ext, left bool, recs ...Rec) error {
 		return err
 	}
 	return t.expect(ruptela.AckRecords, 1)
+}
+
+// Binaries lists the binary commands received so far.
+func (t *Tracker) Binaries() []Binary {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]Binary(nil), t.bin...)
+}
+
+// AddFile stores a camera file under an 8-character name on a source (0
+// camera A SD card, 1 camera B, 2 and 3 camera memory on port A or B).
+func (t *Tracker) AddFile(source int, name string, data []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.files == nil {
+		t.files = map[fileKey][]byte{}
+	}
+	t.files[fileKey{source, fmt.Sprintf("%-8.8s", name)}] = append([]byte(nil), data...)
+}
+
+func (t *Tracker) binaryAnswer(cmd byte, p []byte) {
+	switch cmd {
+	case ruptela.GetVersion:
+		v := t.Version
+		if v == "" {
+			v = "542C,00.02.24.00,668,22,1"
+		}
+		_ = t.Send(ruptela.CmdVersion, []byte(v))
+	case ruptela.Files:
+		if len(p) < 2 {
+			return
+		}
+		sub, src := p[0], int(p[1])
+		t.mu.Lock()
+		size := t.PacketSize
+		if size <= 0 {
+			size = 512
+		}
+		var names []string
+		for k := range t.files {
+			if k.source == src {
+				names = append(names, k.name)
+			}
+		}
+		var data []byte
+		var name string
+		if sub == 2 && len(p) >= 12 {
+			name = string(p[2:10])
+			data = t.files[fileKey{src, name}]
+		}
+		t.mu.Unlock()
+		sort.Strings(names)
+		switch sub {
+		case 0:
+			_ = t.Send(ruptela.CmdFiles, binary.BigEndian.AppendUint16([]byte{0, byte(src)}, uint16(len(names))))
+		case 1:
+			b := []byte{1, byte(src), byte(len(names))}
+			for _, n := range names {
+				b = append(b, n...)
+			}
+			_ = t.Send(ruptela.CmdFiles, b)
+		case 2:
+			if len(p) < 12 {
+				return
+			}
+			n := int(binary.BigEndian.Uint16(p[10:12]))
+			total := (len(data) + size - 1) / size
+			b := []byte{2, byte(src)}
+			if data == nil || n >= total {
+				b = append(b, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0)
+				_ = t.Send(ruptela.CmdFiles, b)
+				return
+			}
+			b = append(b, name...)
+			b = binary.BigEndian.AppendUint16(b, uint16(total))
+			b = binary.BigEndian.AppendUint16(b, uint16(n))
+			_ = t.Send(ruptela.CmdFiles, append(b, data[n*size:min((n+1)*size, len(data))]...))
+		}
+	}
+}
+
+// DTC is one diagnostic trouble code.
+type DTC struct {
+	Source   byte // 0xFF OBD, 1 J1939, 2 J1708
+	Time     time.Time
+	Lat, Lon float64
+	History  bool
+	Code     string // the 5-byte code: text for OBD ("P0010"), the bytes for J1939 and J1708
+}
+
+// DTCs builds a command 9 payload.
+func DTCs(codes ...DTC) []byte {
+	b := []byte{byte(len(codes))}
+	for _, d := range codes {
+		b = append(b, d.Source)
+		b = binary.BigEndian.AppendUint32(b, uint32(d.Time.Unix()))
+		b = binary.BigEndian.AppendUint32(b, uint32(int32(d.Lon*1e7)))
+		b = binary.BigEndian.AppendUint32(b, uint32(int32(d.Lat*1e7)))
+		st := byte(1)
+		if d.History {
+			st = 2
+		}
+		b = append(b, st)
+		b = append(b, fmt.Sprintf("%-5.5s", d.Code)...)
+	}
+	return b
+}
+
+// TroubleCodes sends trouble codes and waits for their acknowledgement.
+func (t *Tracker) TroubleCodes(codes ...DTC) error {
+	if err := t.Send(ruptela.CmdDTC, DTCs(codes...)); err != nil {
+		return err
+	}
+	return t.expect(ruptela.AckDTC, 1)
 }

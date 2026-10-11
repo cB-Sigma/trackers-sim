@@ -36,6 +36,11 @@ those tests: the terminal ID 866496077582164 (jt808sim), the IMEI
 and cmd/trackersim documentation). They are used as protocol facts and
 demo values.
 
+The interop module (test-only, not part of the published module) runs the
+traccar/traccar:6.16.0 Docker image unchanged as the peer of its tests,
+and its comparison notes describe what Traccar's command encoders at tag
+v6.16.0 send. Nothing of Traccar is distributed.
+
 Traccar Client (https://github.com/traccar/traccar-client)
 Copyright Anton Tananaev
 Licensed under the Apache License, Version 2.0.
@@ -52,7 +57,8 @@ Manufacturers' documents
 
 The frames follow the manufacturers' published protocol documents named
 in PROVENANCE.md (Concox, Teltonika, Coban, Queclink, Meitrack, Ruptela,
-Jimi IoT, HuaSunTeK, Cantrack) and, for ais140sim, the field layouts of
+Jimi IoT, HuaSunTeK, Cantrack, Gurtam, Galileosky, ATrack, Eelink, 3G
+Electronics) and, for ais140sim, the field layouts of
 AIS-140 and its amendments (ARAI). The layouts are protocol facts; no
 text of these documents is reproduced.
 
@@ -67,7 +73,9 @@ Trademarks
 ----------
 
 Concox, Jimi IoT, Teltonika, Queclink, Meitrack, Ruptela, HuaSunTeK,
-Cantrack, Sinotrack, Coban, Traccar and OsmAnd are trademarks or names of
+Cantrack, Sinotrack, Coban, Traccar, OsmAnd, Wialon and Gurtam,
+Galileosky, Suntech, CalAmp and LMU, ATrack, Eelink and SeTracker are
+trademarks or names of
 their owners. They are used here only to say which devices, protocols and
 software these simulators imitate. AIS-140 is a standard published by
 ARAI (Automotive Research Association of India) under the Ministry of

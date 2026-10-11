@@ -1,14 +1,25 @@
+// Copyright 2026 Abhinav Gautam
+// SPDX-License-Identifier: Apache-2.0
+
 // Package jt808sim is a JT/T 808 vehicle terminal for tests and demos,
-// behaving like a Jimi JT808 tracker: it registers (0x0100) and keeps the
-// authentication code it is given, authenticates (0x0102), sends
-// heartbeats, locations and batches and waits for the platform's
-// answers, and answers commands: 0x0001 general responses, 0x0201 to a
-// location query, 0x0500 with its fuel line status to vehicle control,
-// and a 0x6006 text (or 0x0900 pass-through) answer after a text command.
+// behaving like a Jimi JT808 tracker: it registers (0x0100, in the 2011,
+// 2013 or 2019 layout) and keeps the authentication code it is given,
+// authenticates (0x0102), sends heartbeats, locations and batches (also
+// cut into subpackages) and waits for the platform's answers, and answers
+// commands: 0x0001 general responses, 0x0201 to a location query, 0x0500
+// with its fuel line status to vehicle control, a 0x6006 text (or 0x0900
+// pass-through) answer after a text command, 0x8105 reboot and 0x8103
+// parameters (kept; 0x0029 sets the report interval). As an active
+// safety (ADAS/DSM) terminal it sends alarm locations with item 0x64 or
+// 0x65; as a JT/T 1078 terminal it answers 0x9003 with 0x1003, 0x9205
+// with a 0x1205 resource list and 0x9101, 0x9102, 0x9201, 0x9202 with
+// 0x0001; with an RSA key it exchanges keys (0x0A00, 0x8A00) and sends
+// and reads RSA-encrypted bodies.
 package jt808sim
 
 import (
 	"bufio"
+	"crypto/rsa"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -44,6 +55,21 @@ type Tracker struct {
 	StuckRelay bool
 	// AuthCode is the code the platform issued at registration.
 	AuthCode string
+	// V2011 registers in the JT/T 808-2011 layout (8-byte model) with the
+	// 2013 header.
+	V2011 bool
+	// RebootDrops closes the connection after answering a reboot, as a
+	// terminal that restarts does.
+	RebootDrops bool
+	// Resources is the recording list a 0x9205 (or 0x9201) is answered
+	// with (nil: one recording of the queried channel).
+	Resources []Resource
+	// Key is the terminal's RSA key, sent in 0x0A00 (ExchangeKeys, or
+	// when the platform sends its key); commands encrypted for it are
+	// decrypted. Encrypt sends bodies encrypted with the platform's key
+	// once it is known.
+	Key     *rsa.PrivateKey
+	Encrypt bool
 
 	c      net.Conn
 	wmu    sync.Mutex
@@ -53,6 +79,12 @@ type Tracker struct {
 	cmds   []Command
 	cut    bool
 	last   Pos
+
+	reboots  int
+	params   map[uint32][]byte
+	platKey  *rsa.PublicKey
+	keyWait  chan *rsa.PublicKey
+	listWait chan struct{}
 }
 
 // Command is a platform command the terminal received.
@@ -106,7 +138,11 @@ func (t *Tracker) header(id uint16) jt808.Header {
 // Send writes a message with this ID and body; it returns its serial.
 func (t *Tracker) Send(id uint16, body []byte) (uint16, error) {
 	h := t.header(id)
-	return h.Serial, t.SendRaw(jt808.Encode(h, body))
+	body, err := t.seal(&h, body)
+	if err != nil {
+		return 0, err
+	}
+	return h.Serial, t.SendRaw(jt808.EncodeWith(h, body))
 }
 
 // SendRaw writes bytes as they are.
@@ -171,6 +207,10 @@ func (t *Tracker) Register() error {
 		b = append(b, pad("JIMI", 11)...)
 		b = append(b, pad("VL103M", 30)...)
 		b = append(b, pad("JM0000001", 30)...)
+	} else if t.V2011 {
+		b = append(b, pad("JIMI", 5)...)
+		b = append(b, pad("VL103M", 8)...)
+		b = append(b, pad("JM00001", 7)...)
 	} else {
 		b = append(b, pad("JIMI", 5)...)
 		b = append(b, pad("VL103M", 20)...)
@@ -240,6 +280,9 @@ type Pos struct {
 	// Mileage is the odometer in km (item 0x01), GSM the signal (0x30).
 	Mileage float64
 	GSM     int
+	// Items are further additional items, sent as they are after the
+	// others (SafetyItem makes an active safety one).
+	Items []byte
 }
 
 // LocationBody encodes a location body (basic block and items 0x01, 0x30,
@@ -282,7 +325,7 @@ func LocationBody(p Pos, fuelCut bool, zone *time.Location) []byte {
 	b = append(b, 0x01, 4)
 	b = binary.BigEndian.AppendUint32(b, uint32(p.Mileage*10+0.5))
 	b = append(b, 0x30, 1, byte(p.GSM), 0x31, 1, byte(p.Sats))
-	return b
+	return append(b, p.Items...)
 }
 
 // Location sends a 0x0200 report and waits for the answer.
@@ -319,10 +362,22 @@ func (t *Tracker) read() {
 			close(t.acks)
 			return
 		}
+		if f.Props&jt808.PropRSA != 0 {
+			if t.Key == nil {
+				continue
+			}
+			if f.Body, err = jt808.DecryptBody(t.Key, f.Body); err != nil {
+				continue
+			}
+		}
 		switch f.ID {
 		case jt808.MPlatformResponse, jt808.MRegisterAnswer:
 			t.acks <- f
 			continue
+		case jt808.MPlatformRSA:
+			if t.platformKey(f) {
+				continue
+			}
 		}
 		cmd := Command{ID: f.ID, Serial: f.Serial, Body: append([]byte(nil), f.Body...)}
 		switch f.ID {
@@ -402,6 +457,11 @@ func (t *Tracker) Respond(cmd Command) error {
 			return nil
 		}
 		return t.Text(cmd.ID == jt808.MDownlinkPass, ans)
+	}
+	if res == 0 {
+		if handled, err := t.respondMore(cmd); handled {
+			return err
+		}
 	}
 	return t.General(cmd.Serial, cmd.ID, res)
 }

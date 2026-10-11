@@ -8,6 +8,11 @@
 // real-time locate (AT+GTRTO sub-command 1) with +RESP:GTRTL after the
 // acknowledgement. Frame layouts follow the examples of Queclink's GV300N
 // @Track Air Interface Protocol 3.01.
+//
+// With Hex set the tracker sends its heartbeats, reports and
+// acknowledgements in the HEX (binary) format (<Protocol Format> 1) with
+// the masks HexReportMask, HexAckMask and HexHeartbeatMask; commands and
+// the server's +SACK answers stay ASCII, as on the device.
 package queclinksim
 
 import (
@@ -46,6 +51,9 @@ type Tracker struct {
 	Hold bool
 	// Last is the position a locate is answered with.
 	Last Pos
+	// Hex sends heartbeats, reports and acknowledgements in the HEX
+	// format instead of ASCII.
+	Hex bool
 
 	c     net.Conn
 	sacks chan string
@@ -176,11 +184,13 @@ func (t *Tracker) command(line string) {
 	send()
 }
 
-func (t *Tracker) next() string {
+func (t *Tracker) next() string { return fmt.Sprintf("%04X", t.nextN()) }
+
+func (t *Tracker) nextN() uint16 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.count++
-	return fmt.Sprintf("%04X", t.count)
+	return t.count
 }
 
 func now() string { return time.Now().UTC().Format("20060102150405") }
@@ -196,6 +206,9 @@ func (t *Tracker) Send(frame string) error {
 // Ack acknowledges a command by its name (GTOUT), sub-command string (for
 // GTRTO, "" otherwise) and serial number.
 func (t *Tracker) Ack(name, sub, serial string) error {
+	if t.Hex {
+		return t.hexAck(name, sub, serial)
+	}
 	f := []string{"+ACK:" + name, Version, t.IMEI, ""}
 	if sub != "" {
 		f = append(f, sub)
@@ -208,8 +221,15 @@ func (t *Tracker) Ack(name, sub, serial string) error {
 // the same count number; it fails when the server closes the connection
 // (an unlisted or blocked device) or does not answer.
 func (t *Tracker) Heartbeat(timeout time.Duration) error {
-	cnt := t.next()
-	if err := t.Send("+ACK:GTHBD," + Version + "," + t.IMEI + ",," + now() + "," + cnt + "$"); err != nil {
+	n := t.nextN()
+	cnt := fmt.Sprintf("%04X", n)
+	var err error
+	if t.Hex {
+		err = t.hexHeartbeat(n)
+	} else {
+		err = t.Send("+ACK:GTHBD," + Version + "," + t.IMEI + ",," + now() + "," + cnt + "$")
+	}
+	if err != nil {
 		return err
 	}
 	tm := time.NewTimer(timeout)
@@ -251,6 +271,13 @@ func block(p Pos) string {
 // GTRTL, GTGEO, GTHBM, GTTOW, GTIGL…): reserved, report ID/type rt, one
 // position, mileage. history sends it as +BUFF.
 func (t *Tracker) Report(name, rt string, p Pos, history bool) error {
+	if t.Hex {
+		extra := []byte{hexByte(rt)}
+		if name == "GTSOS" {
+			extra = append(extra, 0x55) // microphone and speaker volume
+		}
+		return t.hexReport(false, history, hexRSPTypes[name], hexIO{battery: 90, mv: 12400, in: 1, motion: 0x22}, extra, []Pos{p})
+	}
 	head := "+RESP:"
 	if history {
 		head = "+BUFF:"
@@ -262,6 +289,10 @@ func (t *Tracker) Report(name, rt string, p Pos, history bool) error {
 // external voltage (mV), battery percentage and device status (6 hex
 // digits: motion state, inputs, outputs).
 func (t *Tracker) Fixed(ps []Pos, mv, battery int, status string) error {
+	if t.Hex {
+		motion, in, out := hexStatus(status)
+		return t.hexReport(false, false, hexRSPTypes["GTFRI"], hexIO{battery: battery, mv: mv, in: in, out: out, motion: motion}, []byte{0x10}, ps)
+	}
 	var b []string
 	for _, p := range ps {
 		b = append(b, block(p))
@@ -275,8 +306,36 @@ func (t *Tracker) Fixed(ps []Pos, mv, battery int, status string) error {
 // GTIGF: duration; GTSTT: state; GTBPL: battery volts) and which has no
 // report ID or number (GTMPN, GTMPF: value "").
 func (t *Tracker) Event(name, value string, p Pos) error {
+	if t.Hex {
+		return t.hexEvent(name, value, p)
+	}
 	if value == "" {
 		return t.Send(fmt.Sprintf("+RESP:%s,%s,%s,,%s,%s,%s$", name, Version, t.IMEI, block(p), now(), t.next()))
 	}
 	return t.Send(fmt.Sprintf("+RESP:%s,%s,%s,,%s,%s,%s,%s$", name, Version, t.IMEI, value, block(p), now(), t.next()))
+}
+
+// hexEvent sends an +EVT: the value is the ignition duration in seconds
+// (GTIGN, GTIGF), the motion state (GTSTT) or the backup battery in volts
+// (GTBPL).
+func (t *Tracker) hexEvent(name, value string, p Pos) error {
+	io := hexIO{battery: 90, mv: 12400, in: 1, motion: 0x21}
+	var extra []byte
+	switch name {
+	case "GTIGN", "GTIGF":
+		var s uint32
+		_, _ = fmt.Sscanf(value, "%d", &s)
+		extra = []byte{byte(s >> 24), byte(s >> 16), byte(s >> 8), byte(s)}
+		if name == "GTIGF" {
+			io.in, io.motion = 0, 0x11
+		}
+	case "GTSTT":
+		io.motion = hexByte(value)
+	case "GTBPL":
+		var v float64
+		_, _ = fmt.Sscanf(value, "%g", &v)
+		mv := int(v*1000 + 0.5)
+		extra = []byte{byte(mv >> 8), byte(mv)}
+	}
+	return t.hexReport(true, false, hexEVTTypes[name], io, extra, []Pos{p})
 }

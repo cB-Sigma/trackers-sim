@@ -16,6 +16,10 @@ import (
 
 	"github.com/cB-Sigma/trackers-sim/sim"
 	"github.com/cB-Sigma/trackers/ais140"
+	"github.com/cB-Sigma/trackers/atrack"
+	"github.com/cB-Sigma/trackers/calamp"
+	"github.com/cB-Sigma/trackers/eelink"
+	"github.com/cB-Sigma/trackers/galileosky"
 	"github.com/cB-Sigma/trackers/gt06"
 	"github.com/cB-Sigma/trackers/h02"
 	"github.com/cB-Sigma/trackers/jt808"
@@ -23,15 +27,82 @@ import (
 	"github.com/cB-Sigma/trackers/osmand"
 	"github.com/cB-Sigma/trackers/queclink"
 	"github.com/cB-Sigma/trackers/ruptela"
+	"github.com/cB-Sigma/trackers/suntech"
 	"github.com/cB-Sigma/trackers/teltonika"
 	"github.com/cB-Sigma/trackers/tk103"
 	"github.com/cB-Sigma/trackers/track"
+	"github.com/cB-Sigma/trackers/watch"
+	"github.com/cB-Sigma/trackers/wialon"
 )
 
 var codecs = map[string]track.NewCodec{
-	"ais140": ais140.NewCodec, "gt06": gt06.NewCodec, "h02": h02.NewCodec, "jt808": jt808.NewCodec,
+	"ais140": ais140.NewCodec, "atrack": atrack.NewCodec, "calamp": calamp.NewCodec, "eelink": eelink.NewCodec,
+	"galileosky": galileosky.NewCodec, "gt06": gt06.NewCodec, "h02": h02.NewCodec, "jt808": jt808.NewCodec,
 	"meitrack": meitrack.NewCodec, "osmand": osmand.NewCodec, "queclink": queclink.NewCodec,
-	"ruptela": ruptela.NewCodec, "teltonika": teltonika.NewCodec, "tk103": tk103.NewCodec,
+	"ruptela": ruptela.NewCodec, "suntech": suntech.NewCodec, "teltonika": teltonika.NewCodec, "tk103": tk103.NewCodec,
+	"watch": watch.NewCodec, "wialon": wialon.NewCodec,
+}
+
+// udpOnly are the protocols whose simulator speaks UDP only.
+var udpOnly = map[string]bool{"calamp": true}
+
+// serveUDP is server for a codec's datagram framing (track.DatagramCodec).
+func serveUDP(t *testing.T, nc func() track.Codec, cmd any) (*server, string) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	s := &server{imeis: map[string]bool{}}
+	codec := nc()
+	dc, ok := codec.(track.DatagramCodec)
+	if !ok {
+		t.Fatal("the codec has no datagram framing")
+	}
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			ms, err := dc.DecodeDatagram(append([]byte(nil), buf[:n]...))
+			if err != nil {
+				continue
+			}
+			for _, m := range ms {
+				if len(m.Reply) > 0 {
+					_, _ = pc.WriteTo(m.Reply, from)
+				}
+				s.mu.Lock()
+				if m.IMEI != "" {
+					s.imeis[m.IMEI] = true
+				}
+				send := false
+				for _, rec := range m.Records {
+					if rec.Fix != nil {
+						s.fixes = append(s.fixes, *rec.Fix)
+						send = cmd != nil && !s.sent
+					}
+				}
+				if send {
+					s.sent = true
+				}
+				s.mu.Unlock()
+				if send {
+					b, _, err := codec.Command(m.IMEI, cmd, 7)
+					s.mu.Lock()
+					s.err = err
+					s.mu.Unlock()
+					if err == nil {
+						_, _ = pc.WriteTo(b, from)
+					}
+				}
+			}
+		}
+	}()
+	return s, pc.LocalAddr().String()
 }
 
 // server is a minimal tracker server on a library codec: it answers what
@@ -140,14 +211,24 @@ func TestRunEveryProtocol(t *testing.T) {
 				cmd = nil // phone apps take no commands
 			case "ais140":
 				cmd = map[string]any{"op": "GET", "param": "001"}
+			case "calamp", "wialon":
+				// no named locate in the protocol: a text command
+				cmd = map[string]any{"text": "getstatus"}
 			}
-			s := serve(t, mk, cmd)
+			var s *server
+			var addr string
+			if udpOnly[proto] {
+				s, addr = serveUDP(t, mk, cmd)
+			} else {
+				s = serve(t, mk, cmd)
+				addr = s.ln.Addr().String()
+			}
 			imei := "359710049099999"
 			var mu sync.Mutex
 			var got []string
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			err = sim.Run(ctx, sim.Config{Protocol: proto, Server: s.ln.Addr().String(), IMEI: imei, Password: "1234",
+			err = sim.Run(ctx, sim.Config{Protocol: proto, Server: addr, IMEI: imei, Password: "1234",
 				Every: 150 * time.Millisecond, Count: 4,
 				OnCommand: func(c string) { mu.Lock(); got = append(got, c); mu.Unlock() }})
 			if err != nil {

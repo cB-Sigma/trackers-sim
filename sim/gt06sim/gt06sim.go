@@ -1,6 +1,9 @@
 // Package gt06sim is a GT06/Concox tracker for tests and demos: it logs in,
-// sends location, status, alarm, cell (LBS) and WiFi frames, waits for the server's
-// acknowledgements and answers 0x80 commands.
+// sends location, status, alarm, cell (LBS) and WiFi frames, the time
+// request (0x8A), information frames (0x94: external voltage, status text,
+// door, IMSI and ICCID), the 0x23 heartbeat and the 4G location (0xA0) and
+// cells (0xA1), waits for the server's acknowledgements and answers 0x80
+// commands.
 package gt06sim
 
 import (
@@ -328,6 +331,142 @@ func (t *Tracker) WiFi(protocol byte, at time.Time, aps []AP, mcc uint16, mnc by
 	}
 	if f.Protocol != protocol || !f.CountHeader || string(f.Content) != string(frame[4:10]) {
 		return fmt.Errorf("unexpected answer 0x%02X % X", f.Protocol, f.Content)
+	}
+	return nil
+}
+
+// TimeRequest sends a 0x8A time request and returns the UTC time the
+// server answered with.
+func (t *Tracker) TimeRequest() (time.Time, error) {
+	if err := t.Send(gt06.PTime, nil); err != nil {
+		return time.Time{}, err
+	}
+	f, err := t.Ack(3 * time.Second)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if f.Protocol != gt06.PTime || len(f.Content) < 6 {
+		return time.Time{}, fmt.Errorf("unexpected answer 0x%02X % X", f.Protocol, f.Content)
+	}
+	c := f.Content
+	return time.Date(2000+int(c[0]), time.Month(c[1]), int(c[2]), int(c[3]), int(c[4]), int(c[5]), 0, time.UTC), nil
+}
+
+// Info sends a 0x94 information frame: a sub-protocol and its data (the
+// server does not answer). See ExternalVoltage, StatusText, Door and IDs.
+func (t *Tracker) Info(sub byte, data []byte) error {
+	return t.Send(gt06.PInfo, append([]byte{sub}, data...))
+}
+
+// ExternalVoltage sends the external power voltage (0x94 sub-protocol 0x00).
+func (t *Tracker) ExternalVoltage(volts float64) error {
+	return t.Info(0x00, binary.BigEndian.AppendUint16(nil, uint16(volts*100+0.5)))
+}
+
+// StatusText sends the terminal's status text (0x94 sub-protocol 0x04),
+// such as "ALM1=C4;DYD=01;".
+func (t *Tracker) StatusText(s string) error { return t.Info(0x04, []byte(s)) }
+
+// Door sends the door state (0x94 sub-protocol 0x05).
+func (t *Tracker) Door(open bool) error {
+	b := byte(0)
+	if open {
+		b = 1
+	}
+	return t.Info(0x05, []byte{b})
+}
+
+// IDs sends the IMEI, IMSI and ICCID as packed decimal (0x94 sub-protocol
+// 0x0A); imsi has up to 16 digits, iccid up to 20.
+func (t *Tracker) IDs(imsi, iccid string) error {
+	pack := func(s string, n int) ([]byte, error) {
+		for len(s) < 2*n {
+			s = "0" + s
+		}
+		return hex.DecodeString(s)
+	}
+	a, err := pack(t.IMEI, 8)
+	if err != nil {
+		return err
+	}
+	b, err := pack(imsi, 8)
+	if err != nil {
+		return err
+	}
+	c, err := pack(iccid, 10)
+	if err != nil {
+		return err
+	}
+	return t.Info(0x0A, append(append(a, b...), c...))
+}
+
+// Heartbeat sends a 0x23 heartbeat (terminal information byte, battery
+// voltage, GSM level) and waits for its acknowledgement.
+func (t *Tracker) Heartbeat(info byte, volts float64, gsm byte) error {
+	c := []byte{info}
+	c = binary.BigEndian.AppendUint16(c, uint16(volts*100+0.5))
+	c = append(c, gsm, 0x00, 0x02)
+	if err := t.Send(gt06.PHeartbeat, c); err != nil {
+		return err
+	}
+	f, err := t.Ack(3 * time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Protocol != gt06.PHeartbeat {
+		return fmt.Errorf("unexpected answer 0x%02X", f.Protocol)
+	}
+	return nil
+}
+
+// Cell4G is a simulated 4G cell: LAC and cell ID of the wider 4G fields.
+type Cell4G struct {
+	LAC  uint32
+	CID  uint64
+	RSSI int
+}
+
+// Location4G sends a 0xA0 location with a 4G serving cell (acc on).
+func (t *Tracker) Location4G(p Pos, mcc uint16, mnc byte, cell Cell4G, history bool) error {
+	c := GPS(p)
+	c = binary.BigEndian.AppendUint16(c, mcc)
+	c = append(c, mnc)
+	c = binary.BigEndian.AppendUint32(c, cell.LAC)
+	c = binary.BigEndian.AppendUint64(c, cell.CID)
+	re := byte(0)
+	if history {
+		re = 1
+	}
+	c = append(c, 0x01, 0x00, re)
+	return t.Send(gt06.P4GLocation, c)
+}
+
+// LBS4G sends a 0xA1 frame of up to seven 4G cells and waits for its
+// acknowledgement.
+func (t *Tracker) LBS4G(at time.Time, mcc uint16, mnc byte, cells []Cell4G) error {
+	u := at.UTC()
+	c := []byte{byte(u.Year() - 2000), byte(u.Month()), byte(u.Day()), byte(u.Hour()), byte(u.Minute()), byte(u.Second())}
+	c = binary.BigEndian.AppendUint16(c, mcc)
+	c = append(c, mnc)
+	for i := range 7 {
+		var x Cell4G
+		if i < len(cells) {
+			x = cells[i]
+		}
+		c = binary.BigEndian.AppendUint32(c, x.LAC)
+		c = binary.BigEndian.AppendUint64(c, x.CID)
+		c = append(c, byte(-x.RSSI))
+	}
+	c = append(c, 0xFF, 0x00, 0x02) // timing advance unknown, language
+	if err := t.Send(gt06.P4GLBSMulti, c); err != nil {
+		return err
+	}
+	f, err := t.Ack(3 * time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Protocol != gt06.P4GLBSMulti {
+		return fmt.Errorf("unexpected answer 0x%02X", f.Protocol)
 	}
 	return nil
 }

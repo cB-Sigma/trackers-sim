@@ -421,6 +421,51 @@ func (d *Device) Normal(f Fix) string {
 	return frameOf(body)
 }
 
+// Vendors are the manufacturer layouts NormalVendor builds.
+var Vendors = []string{"rlp", "ctpl"}
+
+// NormalVendor is a data packet in a manufacturer's earlier layout, as the
+// ais140 package reads it by anchors: "rlp" (header RLP, the date and time
+// before the fix flag, then the frame number, odometer in km, an analog
+// input, three accelerations and two tilts after the digital I/O) or
+// "ctpl" (vendor CTPL, the frame number and odometer after the digital
+// I/O). Other names build the Table 4A(2) packet (Normal).
+func (d *Device) NormalVendor(vendor string, f Fix, odometerKm float64) string {
+	d.mu.Lock()
+	d.frame++
+	frame := d.frame
+	d.mu.Unlock()
+	pt := f.PacketType
+	if pt == "" {
+		pt = "NR"
+	}
+	id := f.AlertID
+	if id == 0 {
+		id = 1
+	}
+	st := "L"
+	if f.History {
+		st = "H"
+	}
+	lat, ns, lon, ew := hemi(f.Lat, f.Lon)
+	tamper := "C"
+	if f.BoxOpen {
+		tamper = "O"
+	}
+	t := f.Time.UTC()
+	common := fmt.Sprintf("%.6f,%s,%.6f,%s,%.1f,%.1f,%d,900.0,1.1,0.6,SIMNET,%s,%s,%.1f,%.2f,%s,%s,%d,404,45,0d33,cc17,0001,00",
+		lat, ns, lon, ew, f.Speed, f.Heading, f.Sats, b01(f.Ignition), b01(f.Power), f.MainV, f.BatteryV, b01(f.Emergency), tamper, f.GSM)
+	switch vendor {
+	case "rlp":
+		return frameOf(fmt.Sprintf("RLP,N.A,%s,%s,%02d,%s,%s,N.A,%s,%s,%s,%s,%d,%.1f,0.0,0.12,-0.05,0.98,2,1",
+			d.Firmware, pt, id, st, d.IMEI, t.Format("02012006"), t.Format("150405"), b01(f.Valid), common, frame, odometerKm))
+	case "ctpl":
+		return frameOf(fmt.Sprintf(",C,CTPL,%s,%s,%02d,%s,%s,%s,%s,%s,%s,%s,%d,%.1f",
+			d.Firmware, pt, id, st, d.IMEI, d.Vehicle, b01(f.Valid), t.Format("02012006"), t.Format("150405"), common, frame, odometerKm))
+	}
+	return d.Normal(f)
+}
+
 // Health is a health packet (Table 3B).
 func (d *Device) Health(battery int) string {
 	return frameOf(fmt.Sprintf("HLM,%s,%s,%s,%d,20,15.00,10,60,00010000,0.00,0.00", d.Vendor, d.Firmware, d.IMEI, battery))
